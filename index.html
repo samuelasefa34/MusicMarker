@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SonicLab DAW</title>
+    
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'metal-dark': '#1a1a1a',
+                        'metal-light': '#2d2d2d',
+                        'led-active': '#00ff9d',
+                        'led-off': '#1f2937',
+                    },
+                    fontFamily: {
+                        mono: ['Courier New', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        body { background-color: #0f0f0f; color: #e5e5e5; }
+        /* Custom range slider styling for that "Pro Audio" look */
+        input[type=range] {
+            -webkit-appearance: none;
+            background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 16px;
+            width: 16px;
+            border-radius: 50%;
+            background: #d4d4d4;
+            border: 2px solid #404040;
+            cursor: pointer;
+            margin-top: -6px;
+            box-shadow: 0 0 5px rgba(0,0,0,0.5);
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: #404040;
+            border-radius: 2px;
+        }
+        .knob-texture {
+            background-image: repeating-linear-gradient(
+                45deg,
+                transparent,
+                transparent 2px,
+                rgba(255, 255, 255, 0.05) 2px,
+                rgba(255, 255, 255, 0.05) 4px
+            );
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // --- Audio Engine ---
+        
+        // We need a single AudioContext
+        let audioCtx = null;
+        let masterGain = null;
+        let analyser = null;
+        let noiseBuffer = null;
+
+        const initAudio = () => {
+            if (audioCtx) return;
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            audioCtx = new AudioContext();
+            
+            masterGain = audioCtx.createGain();
+            masterGain.gain.value = 0.5;
+            
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 256;
+            
+            masterGain.connect(analyser);
+            analyser.connect(audioCtx.destination);
+
+            // Generate White Noise Buffer (for Snare/HiHat)
+            const bufferSize = audioCtx.sampleRate * 2; // 2 seconds
+            noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = noiseBuffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) {
+                data[i] = Math.random() * 2 - 1;
+            }
+        };
+
+        const playKick = (time, vol) => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            
+            osc.frequency.setValueAtTime(150, time);
+            osc.frequency.exponentialRampToValueAtTime(0.01, time + 0.5);
+            
+            gain.gain.setValueAtTime(vol, time);
+            gain.gain.exponentialRampToValueAtTime(0.01, time + 0.5);
+            
+            osc.connect(gain);
+            gain.connect(masterGain);
+            
+            osc.start(time);
+            osc.stop(time + 0.5);
+        };
+
+        const playSnare = (time, vol) => {
+            // Tone (Triangle)
+            const osc = audioCtx.createOscillator();
+            osc.type = 'triangle';
+            const oscGain = audioCtx.createGain();
+            
+            osc.frequency.setValueAtTime(250, time);
+            oscGain.gain.setValueAtTime(vol * 0.5, time);
+            oscGain.gain.exponentialRampToValueAtTime(0.01, time + 0.1);
+            
+            osc.connect(oscGain);
+            oscGain.connect(masterGain);
+            osc.start(time);
+            osc.stop(time + 0.1);
+
+            // Noise
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = noiseBuffer;
+            const noiseFilter = audioCtx.createBiquadFilter();
+            noiseFilter.type = 'highpass';
+            noiseFilter.frequency.value = 1000;
+            const noiseGain = audioCtx.createGain();
+            
+            noiseGain.gain.setValueAtTime(vol, time);
+            noiseGain.gain.exponentialRampToValueAtTime(0.01, time + 0.2);
+            
+            noise.connect(noiseFilter);
+            noiseFilter.connect(noiseGain);
+            noiseGain.connect(masterGain);
+            
+            noise.start(time);
+            noise.stop(time + 0.2);
+        };
+
+        const playHiHat = (time, vol) => {
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = noiseBuffer;
+            
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'highpass';
+            filter.frequency.value = 5000;
+            
+            const gain = audioCtx.createGain();
+            gain.gain.setValueAtTime(vol * 0.7, time);
+            gain.gain.exponentialRampToValueAtTime(0.01, time + 0.05); // Short decay
+            
+            noise.connect(filter);
+            filter.connect(gain);
+            gain.connect(masterGain);
+            
+            noise.start(time);
+            noise.stop(time + 0.05);
+        };
+
+        const playSynth = (time, vol) => {
+            // A simple detuned saw wave chord stab
+            const freqs = [220, 277.18, 329.63]; // A Minor chord (A3, C#4, E4 - wait C# is Major, let's do A C E => 220, 261, 329)
+            // Let's do A Minor: A, C, E
+            const chord = [220, 261.63, 329.63];
+
+            chord.forEach((freq, i) => {
+                const osc = audioCtx.createOscillator();
+                osc.type = 'sawtooth';
+                osc.frequency.value = freq;
+                
+                // Filter for "pluck" sound
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.setValueAtTime(2000, time);
+                filter.frequency.exponentialRampToValueAtTime(100, time + 0.3);
+
+                const gain = audioCtx.createGain();
+                gain.gain.setValueAtTime(vol * 0.3, time);
+                gain.gain.exponentialRampToValueAtTime(0.01, time + 0.4);
+
+                osc.connect(filter);
+                filter.connect(gain);
+                gain.connect(masterGain);
+
+                osc.start(time);
+                osc.stop(time + 0.4);
+            });
+        };
+
+        // --- Components ---
+
+        const Visualizer = ({ isPlaying }) => {
+            const canvasRef = useRef(null);
+            
+            useEffect(() => {
+                if (!analyser || !canvasRef.current) return;
+                
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                const bufferLength = analyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+                let animationId;
+
+                const draw = () => {
+                    animationId = requestAnimationFrame(draw);
+                    analyser.getByteFrequencyData(dataArray);
+
+                    ctx.fillStyle = '#1a1a1a';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    const barWidth = (canvas.width / bufferLength) * 2.5;
+                    let barHeight;
+                    let x = 0;
+
+                    for(let i = 0; i < bufferLength; i++) {
+                        barHeight = dataArray[i] / 2;
+                        
+                        // Gradient Fill
+                        const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
+                        gradient.addColorStop(0, '#00ff9d');
+                        gradient.addColorStop(1, '#008f5d');
+                        
+                        ctx.fillStyle = gradient;
+                        ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+
+                        x += barWidth + 1;
+                    }
+                };
+
+                if (isPlaying) {
+                    draw();
+                } else {
+                    // Clear canvas if stopped
+                    ctx.fillStyle = '#1a1a1a';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    cancelAnimationFrame(animationId);
+                }
+
+                return () => cancelAnimationFrame(animationId);
+            }, [isPlaying]);
+
+            return (
+                <div className="w-full h-24 bg-metal-dark border-2 border-metal-light rounded-lg overflow-hidden shadow-inner mb-6 relative">
+                    <canvas ref={canvasRef} width="800" height="100" className="w-full h-full"></canvas>
+                    <div className="absolute top-2 right-2 text-xs text-green-500 font-mono">FREQ VISUALIZER</div>
+                </div>
+            );
+        };
+
+        const Knob = ({ label, value, onChange, min = 0, max = 1, step = 0.01 }) => (
+            <div className="flex flex-col items-center gap-2">
+                <div className="text-xs text-gray-400 font-bold uppercase tracking-wider">{label}</div>
+                <input 
+                    type="range" 
+                    min={min} 
+                    max={max} 
+                    step={step} 
+                    value={value} 
+                    onChange={(e) => onChange(parseFloat(e.target.value))}
+                    className="w-24 accent-green-400"
+                />
+            </div>
+        );
+
+        const SonicLab = () => {
+            // Sequencer State: 4 tracks, 16 steps
+            // 0: Kick, 1: Snare, 2: HiHat, 3: Synth
+            const [grid, setGrid] = useState(
+                Array(4).fill().map(() => Array(16).fill(false))
+            );
+            
+            const [isPlaying, setIsPlaying] = useState(false);
+            const [currentStep, setCurrentStep] = useState(0);
+            const [bpm, setBpm] = useState(120);
+            const [volumes, setVolumes] = useState([0.8, 0.7, 0.6, 0.6]); // Per track volume
+            
+            // Refs for timing
+            const nextNoteTimeRef = useRef(0.0);
+            const currentStepRef = useRef(0);
+            const timerIDRef = useRef(null);
+
+            // Names for tracks
+            const tracks = ["KICK", "SNARE", "HI-HAT", "SYNTH"];
+
+            // Scheduler Logic
+            const scheduleNote = (stepNumber, time) => {
+                // Update UI visualization
+                // We use a draw callback to sync UI with audio time
+                setTimeout(() => {
+                    setCurrentStep(stepNumber);
+                }, (time - audioCtx.currentTime) * 1000);
+
+                // Play Sounds if active
+                if (grid[0][stepNumber]) playKick(time, volumes[0]);
+                if (grid[1][stepNumber]) playSnare(time, volumes[1]);
+                if (grid[2][stepNumber]) playHiHat(time, volumes[2]);
+                if (grid[3][stepNumber]) playSynth(time, volumes[3]);
+            };
+
+            const scheduler = () => {
+                // lookahead: 25ms
+                const lookahead = 25.0; 
+                // schedule ahead: 0.1s
+                const scheduleAheadTime = 0.1;
+
+                while (nextNoteTimeRef.current < audioCtx.currentTime + scheduleAheadTime) {
+                    scheduleNote(currentStepRef.current, nextNoteTimeRef.current);
+                    
+                    // Advance step
+                    const secondsPerBeat = 60.0 / bpm;
+                    // 16th notes = 0.25 beats
+                    nextNoteTimeRef.current += 0.25 * secondsPerBeat;
+                    
+                    currentStepRef.current = (currentStepRef.current + 1) % 16;
+                }
+                timerIDRef.current = window.setTimeout(scheduler, lookahead);
+            };
+
+            const togglePlay = () => {
+                if (!isPlaying) {
+                    initAudio();
+                    if (audioCtx.state === 'suspended') audioCtx.resume();
+                    
+                    currentStepRef.current = 0;
+                    nextNoteTimeRef.current = audioCtx.currentTime;
+                    scheduler();
+                    setIsPlaying(true);
+                } else {
+                    window.clearTimeout(timerIDRef.current);
+                    setIsPlaying(false);
+                    setCurrentStep(0); // Reset visual
+                }
+            };
+
+            const toggleCell = (trackIndex, stepIndex) => {
+                const newGrid = [...grid];
+                newGrid[trackIndex][stepIndex] = !newGrid[trackIndex][stepIndex];
+                setGrid(newGrid);
+            };
+
+            const handleVolumeChange = (trackIndex, val) => {
+                const newVols = [...volumes];
+                newVols[trackIndex] = val;
+                setVolumes(newVols);
+            };
+
+            const handleClear = () => {
+                setGrid(Array(4).fill().map(() => Array(16).fill(false)));
+            };
+
+            return (
+                <div className="min-h-screen flex items-center justify-center p-4">
+                    <div className="w-full max-w-4xl bg-gradient-to-b from-metal-light to-metal-dark rounded-xl shadow-2xl border-4 border-gray-700 p-6 relative overflow-hidden">
+                        
+                        {/* Brushed Metal Texture Overlay */}
+                        <div className="absolute inset-0 pointer-events-none opacity-10 mix-blend-overlay knob-texture"></div>
+
+                        {/* Header */}
+                        <div className="flex justify-between items-end mb-6 relative z-10 border-b border-gray-600 pb-4">
+                            <div>
+                                <h1 className="text-3xl font-black italic tracking-tighter text-gray-100">
+                                    <span className="text-green-500">SONIC</span>LAB
+                                </h1>
+                                <p className="text-xs text-gray-400 font-mono">DIGITAL AUDIO WORKSTATION v1.0</p>
+                            </div>
+                            <div className="flex items-center gap-4">
+                                <div className="bg-black p-2 rounded border border-gray-600">
+                                    <div className="text-green-500 font-mono text-xl font-bold">{bpm} <span className="text-xs text-gray-500">BPM</span></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Controls & Visualizer */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6 relative z-10">
+                            {/* Transport Controls */}
+                            <div className="bg-gray-800 p-4 rounded-lg border border-gray-600 shadow-lg flex flex-col justify-between">
+                                <div className="flex justify-between items-center mb-4">
+                                    <span className="text-xs font-bold text-gray-500">TRANSPORT</span>
+                                    <div className={`w-3 h-3 rounded-full ${isPlaying ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-red-900'}`}></div>
+                                </div>
+                                <div className="flex gap-2">
+                                    <button 
+                                        onClick={togglePlay}
+                                        className={`flex-1 py-3 rounded font-bold transition-all shadow-md ${isPlaying 
+                                            ? 'bg-red-600 hover:bg-red-500 text-white border-b-4 border-red-800 active:border-b-0 active:translate-y-1' 
+                                            : 'bg-green-600 hover:bg-green-500 text-white border-b-4 border-green-800 active:border-b-0 active:translate-y-1'}`}
+                                    >
+                                        {isPlaying ? "STOP" : "PLAY"}
+                                    </button>
+                                    <button 
+                                        onClick={handleClear}
+                                        className="px-4 bg-gray-600 hover:bg-gray-500 rounded font-bold text-white border-b-4 border-gray-800 active:border-b-0 active:translate-y-1 transition-all"
+                                    >
+                                        CLR
+                                    </button>
+                                </div>
+                                <div className="mt-4">
+                                     <label className="text-xs text-gray-400 font-bold">TEMPO</label>
+                                     <input 
+                                        type="range" min="60" max="180" value={bpm} 
+                                        onChange={(e) => setBpm(Number(e.target.value))}
+                                        className="w-full mt-1 accent-green-500"
+                                    />
+                                </div>
+                            </div>
+
+                            {/* Mixer */}
+                            <div className="bg-gray-800 p-4 rounded-lg border border-gray-600 shadow-lg col-span-2 flex justify-around items-end">
+                                {tracks.map((track, i) => (
+                                    <div key={track} className="flex flex-col items-center h-full justify-between">
+                                        <div className="h-24 w-2 bg-black rounded-full relative">
+                                            <div 
+                                                className="absolute bottom-0 w-full bg-green-500 rounded-full"
+                                                style={{ height: `${volumes[i] * 100}%` }}
+                                            ></div>
+                                            <input 
+                                                type="range" 
+                                                min="0" max="1" step="0.05"
+                                                value={volumes[i]}
+                                                onChange={(e) => handleVolumeChange(i, parseFloat(e.target.value))}
+                                                className="absolute bottom-0 w-24 -left-11 origin-center -rotate-90 translate-y-10 opacity-0 cursor-pointer h-full"
+                                                style={{ width: '6rem', height: '100%'}}
+                                            />
+                                        </div>
+                                        <span className="text-[10px] font-bold text-gray-400 mt-2 tracking-widest">{track}</span>
+                                    </div>
+                                ))}
+                                <div className="flex flex-col items-center h-full justify-between border-l border-gray-600 pl-4">
+                                     <div className="text-[10px] font-bold text-green-500 tracking-widest mb-2">MASTER</div>
+                                     <div className="w-8 h-8 rounded-full border-2 border-green-500 flex items-center justify-center">
+                                        <div className={`w-4 h-4 bg-green-500 rounded-full transition-opacity ${isPlaying ? 'opacity-100 animate-pulse' : 'opacity-20'}`}></div>
+                                     </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Visualizer Area */}
+                        <Visualizer isPlaying={isPlaying} />
+
+                        {/* Sequencer Grid */}
+                        <div className="bg-black p-4 rounded-lg border border-gray-700 shadow-[inset_0_2px_4px_rgba(0,0,0,0.6)] relative z-10">
+                            {grid.map((row, trackIndex) => (
+                                <div key={trackIndex} className="flex items-center gap-2 mb-2">
+                                    <div className="w-16 text-right pr-2">
+                                        <span className="text-xs font-bold text-gray-500">{tracks[trackIndex]}</span>
+                                    </div>
+                                    <div className="flex-1 grid grid-cols-16 gap-1">
+                                        {row.map((active, stepIndex) => {
+                                            const isCurrent = currentStep === stepIndex;
+                                            return (
+                                                <button
+                                                    key={stepIndex}
+                                                    onClick={() => toggleCell(trackIndex, stepIndex)}
+                                                    className={`
+                                                        aspect-[2/3] rounded-sm transition-all duration-75 relative
+                                                        ${active ? 'bg-green-500 shadow-[0_0_8px_#22c55e]' : 'bg-gray-800 hover:bg-gray-700'}
+                                                        ${isCurrent ? 'border border-white brightness-125' : 'border border-transparent'}
+                                                        ${stepIndex % 4 === 0 ? 'mr-1' : ''} 
+                                                    `}
+                                                >
+                                                    {/* LED Reflection */}
+                                                    {active && <div className="absolute top-1 left-1 w-1 h-1 bg-white opacity-50 rounded-full"></div>}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            ))}
+                            
+                            {/* Step Indicators */}
+                            <div className="flex items-center gap-2 mt-2">
+                                <div className="w-16"></div>
+                                <div className="flex-1 grid grid-cols-16 gap-1">
+                                    {Array(16).fill().map((_, i) => (
+                                        <div key={i} className={`text-[8px] text-center ${currentStep === i ? 'text-white' : 'text-gray-600'}`}>
+                                            {i + 1}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<SonicLab />);
+    </script>
+</body>
+</html>
